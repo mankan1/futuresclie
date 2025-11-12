@@ -1,14 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * TradeFlash UI – React Tabbed Client (with conId→Symbol mapping + stance)
- * ------------------------------------------------------------------------
+ * TradeFlash UI – React Tabbed Client (with conId→Symbol mapping)
+ * -----------------------------------------------------------------
  * - Connects to a Flow WS server (DEFAULT_WS)
  * - Builds a live map from IB conId → human symbol using broadcasted
  *   { type:"CONID_MAPPING", conid, mapping:{ symbol, type?, right?, strike?, expiry? } }
- * - Renders Stream / Trades / Prints / Quotes tabs
- * - Shows stance (BULL/BEAR/HEDGE?/NEUTRAL) for PRINTs (and Trades if present)
- * - Includes optional stance filter on Trades
+ * - Streams Trades / Prints / Quotes / AutoTrades, with filters and compact money formatting (M, B, k).
  */
 
 const DEFAULT_WS = "ws://localhost:3000/ws";
@@ -43,26 +41,10 @@ const DirPill: React.FC<{ dir?: string }> = ({ dir }) => {
   return <Badge color={color}>{dir || "-"}</Badge>;
 };
 
-const StanceBadge: React.FC<{ stance?: string }> = ({ stance }) => {
-  const color =
-    stance === "BULL" ? "emerald" :
-    stance === "BEAR" ? "rose" :
-    stance === "HEDGE?" ? "sky" :
-    "slate";
-  return (
-    <span
-      className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-${color}-800/20 text-${color}-300 border border-${color}-700/30`}
-    >
-      {stance || "NEUTRAL"}
-    </span>
-  );
-};
-
 function ts(t?: number | string) {
   if (!t) return "";
   try {
-    const v =
-      typeof t === "string" && /\d{4}-\d{2}-\d{2}T/.test(t) ? new Date(t).getTime() : Number(t);
+    const v = typeof t === "string" && /\d{4}-\d{2}-\d{2}T/.test(t) ? new Date(t).getTime() : Number(t);
     return new Date(v).toLocaleTimeString();
   } catch {
     return "";
@@ -75,11 +57,27 @@ function num(x: any, d = 2) {
   return n.toFixed(d);
 }
 
+// Money / quantity formatters for readability
+function fmtMoney(x: any): string {
+  const n = Number(x);
+  if (!isFinite(n)) return "-";
+  if (Math.abs(n) >= 1_000_000_000) return `$${(n / 1_000_000_000).toFixed(2)}B`;
+  if (Math.abs(n) >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
+  if (Math.abs(n) >= 1_000) return `$${(n / 1_000).toFixed(0)}k`;
+  return `$${n.toFixed(0)}`;
+}
+
+function fmtQty(x: any): string {
+  const n = Number(x);
+  if (!isFinite(n)) return "-";
+  if (Math.abs(n) >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (Math.abs(n) >= 1_000) return (n / 1_000).toFixed(0) + "k";
+  return n.toString();
+}
+
 /* ======================= WS Hook ======================= */
 function useWebSocket(url: string) {
-  const [status, setStatus] = useState<"connected" | "connecting" | "disconnected" | "error">(
-    "disconnected"
-  );
+  const [status, setStatus] = useState<"connected" | "connecting" | "disconnected" | "error">("disconnected");
   const [lastMsg, setLastMsg] = useState<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -146,7 +144,6 @@ function labelFromMapping(m?: Mapping): string | undefined {
 }
 
 function useConidMapping(lastMsg: any) {
-  // Use object not Map to keep setState simple
   const [mapState, setMapState] = useState<Record<string | number, Mapping>>({});
 
   useEffect(() => {
@@ -156,12 +153,7 @@ function useConidMapping(lastMsg: any) {
       setMapState((cur) => ({ ...cur, [lastMsg.conid]: lastMsg.mapping as Mapping }));
     }
 
-    // Optional: If server sometimes embeds mapping inside quotes/trades, harvest here as well.
-    if (
-      (lastMsg.type === "LIVE_QUOTE" || lastMsg.type === "UL_LIVE_QUOTE") &&
-      lastMsg.mapping &&
-      lastMsg.conid
-    ) {
+    if ((lastMsg.type === "LIVE_QUOTE" || lastMsg.type === "UL_LIVE_QUOTE") && lastMsg.mapping && lastMsg.conid) {
       setMapState((cur) => ({ ...cur, [lastMsg.conid]: lastMsg.mapping as Mapping }));
     }
   }, [lastMsg]);
@@ -173,27 +165,13 @@ function useConidMapping(lastMsg: any) {
 
   return { conidMap: mapState, resolve };
 }
-
-/* ================= Helpers for stance keys (backward compatibility) === */
-const stanceOf = (x: any) => x?.stance ?? x?.stanceLabel ?? undefined;
-const stanceScoreOf = (x: any) => x?.stanceScore ?? x?.stance_score ?? undefined;
-const stanceNotesOf = (x: any) =>
-  Array.isArray(x?.stanceNotes)
-    ? x.stanceNotes
-    : Array.isArray(x?.stanceReasons)
-    ? x.stanceReasons
-    : [];
-
-/* ======================= Data Buckets ======================= */
 function useStreamBuckets(lastMsg: any, paused: boolean) {
   const [trades, setTrades] = useState<any[]>([]);
   const [prints, setPrints] = useState<any[]>([]);
   const [quotes, setQuotes] = useState<any[]>([]);
+  const [autoTrades, setAutoTrades] = useState<any[]>([]);
   const [welcome, setWelcome] = useState<any>(null);
-  const [avail, setAvail] = useState<{ futures: string[]; equities: string[] }>({
-    futures: [],
-    equities: [],
-  });
+  const [avail, setAvail] = useState<{ futures: string[]; equities: string[] }>({ futures: [], equities: [] });
 
   useEffect(() => {
     if (!lastMsg || paused) return;
@@ -216,9 +194,32 @@ function useStreamBuckets(lastMsg: any, paused: boolean) {
       setQuotes((arr) => [lastMsg, ...arr].slice(0, MAX_ROWS));
       return;
     }
+
+    if (lastMsg.type === "AUTOTRADE_SIM" || lastMsg.type === "AUTOTRADE") {
+      // new trade
+      setAutoTrades((arr) => [lastMsg, ...arr].slice(0, MAX_ROWS));
+      return;
+    }
+
+    if (lastMsg.type === "AUTOTRADE_UPDATE") {
+      // update existing by id
+      setAutoTrades((arr) => {
+        const id = lastMsg.id;
+        if (!id) return arr;
+        const idx = arr.findIndex((t) => t.id === id);
+        if (idx === -1) {
+          // if we never saw the SIM event for some reason, just add
+          return [lastMsg, ...arr].slice(0, MAX_ROWS);
+        }
+        const copy = arr.slice();
+        copy[idx] = { ...copy[idx], ...lastMsg };
+        return copy;
+      });
+      return;
+    }
   }, [lastMsg, paused]);
 
-  return { trades, prints, quotes, welcome, avail };
+  return { trades, prints, quotes, autoTrades, welcome, avail };
 }
 
 /* ======================= Controls ======================= */
@@ -248,10 +249,7 @@ function Toolbar({ wsUrl, setWsUrl, status, onConnect, onDisconnect }: any) {
       >
         Connect
       </button>
-      <button
-        className="px-3 py-2 rounded bg-slate-700 text-slate-50 hover:bg-slate-600"
-        onClick={onDisconnect}
-      >
+      <button className="px-3 py-2 rounded bg-slate-700 text-slate-50 hover:bg-slate-600" onClick={onDisconnect}>
         Disconnect
       </button>
     </div>
@@ -325,9 +323,7 @@ function Tabs({ tabs, active, onTab }: any) {
           <button
             key={t.key}
             onClick={() => onTab(t.key)}
-            className={`px-3 py-2 rounded-t ${
-              active === t.key ? "bg-slate-800 text-white" : "text-slate-300 hover:text-white"
-            }`}
+            className={`px-3 py-2 rounded-t ${active === t.key ? "bg-slate-800 text-white" : "text-slate-300 hover:text-white"}`}
           >
             {t.label}
             {t.count != null && <span className="ml-2 text-xs text-slate-400">{t.count}</span>}
@@ -339,16 +335,23 @@ function Tabs({ tabs, active, onTab }: any) {
 }
 
 /* ======================= Rows ======================= */
-function RowTrade({ d }: { d: any }) {
-  const stance = stanceOf(d);
-  const score = stanceScoreOf(d);
+const StanceBadge: React.FC<{ stance?: string }> = ({ stance }) => {
+  const color =
+    stance === "BULL" ? "emerald" : stance === "BEAR" ? "rose" : stance === "HEDGE?" ? "sky" : "slate";
+  return (
+    <span
+      className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-${color}-800/20 text-${color}-300 border border-${color}-700/30`}
+    >
+      {stance || "NEUTRAL"}
+    </span>
+  );
+};
 
+function RowTrade({ d }: { d: any }) {
   return (
     <div className="p-3 border-b border-slate-800/50 hover:bg-slate-800/30">
       <div className="flex flex-wrap items-center gap-2">
         <DirPill dir={d.direction} />
-        {stance && <StanceBadge stance={stance} />}
-        {typeof score === "number" && <span className="text-xs text-slate-400">({score})</span>}
         {(d.classifications || []).map((t: string) => (
           <Tag key={t} t={t} />
         ))}
@@ -359,20 +362,20 @@ function RowTrade({ d }: { d: any }) {
           {d.symbol} {d.type} ${d.strike}
         </span>
         <span>exp {d.expiry || "-"}</span>
-        <span>size {d.size}</span>
-        <span>OI {d.openInterest}</span>
-        <span>prem ${num(d.premium, 0)}</span>
+        <span>size {fmtQty(d.size)}</span>
+        <span>OI {fmtQty(d.openInterest)}</span>
+        <span>prem {fmtMoney(d.premium)}</span>
         <span>Δ {num(d.greeks?.delta ?? 0, 3)}</span>
         <span>UL ${num(d.underlyingPrice)}</span>
         <span>OPT ${num(d.optionPrice)}</span>
-        <span>vol/OI {num(d.volOiRatio ?? 0, 2)}</span>
+        <span>vol/OI {fmtQty(d.volOiRatio ?? 0)}</span>
         <span className="text-slate-400">{d.assetClass}</span>
       </div>
       {d.historicalComparison && (
         <div className="mt-1 text-xs text-slate-400">
-          hist avgOI {d.historicalComparison.avgOI} | avgVol {d.historicalComparison.avgVolume} | OIΔ{" "}
-          {d.historicalComparison.oiChange} | Vol× {d.historicalComparison.volumeMultiple} | days{" "}
-          {d.historicalComparison.dataPoints}
+          hist avgOI {fmtQty(d.historicalComparison.avgOI)} | avgVol{" "}
+          {fmtQty(d.historicalComparison.avgVolume)} | OIΔ {fmtQty(d.historicalComparison.oiChange)} | Vol×{" "}
+          {d.historicalComparison.volumeMultiple}
         </div>
       )}
     </div>
@@ -380,18 +383,16 @@ function RowTrade({ d }: { d: any }) {
 }
 
 function RowPrint({ p }: { p: any }) {
-  const stance = stanceOf(p);
-  const score = stanceScoreOf(p);
-  const notes = stanceNotesOf(p);
-
   return (
     <div className="p-3 border-b border-slate-800/50 hover:bg-slate-800/30">
       <div className="flex flex-wrap items-center gap-2">
         <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-sky-800/20 text-sky-300 border border-sky-700/30">
           PRINT
         </span>
-        <StanceBadge stance={stance} />
-        {typeof score === "number" && <span className="text-xs text-slate-400">({score})</span>}
+        <StanceBadge stance={p.stance} />
+        {typeof p.stanceScore === "number" && (
+          <span className="text-xs text-slate-400">({p.stanceScore})</span>
+        )}
         <span className="text-slate-400 text-xs">{ts(p.timestamp)}</span>
       </div>
 
@@ -400,15 +401,15 @@ function RowPrint({ p }: { p: any }) {
           {p.symbol} {p.right} ${num(p.strike, 0)}
         </span>
         <span>exp {p.expiry || "-"}</span>
-        <span>size {p.tradeSize}</span>
+        <span>size {fmtQty(p.tradeSize)}</span>
         <span>@ ${num(p.tradePrice)}</span>
-        <span>prem ${num(p.premium, 0)}</span>
-        <span>vol/OI {num(p.volOiRatio ?? 0, 2)}</span>
+        <span>prem {fmtMoney(p.premium)}</span>
+        <span>vol/OI {fmtQty(p.volOiRatio ?? 0)}</span>
         <span>{p.aggressor ? "BUY-agg" : "SELL-agg"}</span>
       </div>
 
-      {notes.length > 0 && (
-        <div className="mt-1 text-xs text-slate-400">{notes.join(" · ")}</div>
+      {Array.isArray(p.stanceNotes) && p.stanceNotes.length > 0 && (
+        <div className="mt-1 text-xs text-slate-400">{p.stanceNotes.join(" · ")}</div>
       )}
     </div>
   );
@@ -431,12 +432,51 @@ function RowQuote({ q, resolve }: { q: any; resolve: (id?: string | number) => M
         <span>bid ${num(q.bid)}</span>
         <span>ask ${num(q.ask)}</span>
         {!isUL && <span>Δ {num(q.delta ?? 0, 3)}</span>}
-        {q.volume != null && <span>vol {q.volume}</span>}
+        {q.volume != null && <span>vol {fmtQty(q.volume)}</span>}
       </div>
     </div>
   );
 }
+function RowAutoTrade({ t }: { t: any }) {
+  const biasColor = t.bias === "BULL" ? "emerald" : t.bias === "BEAR" ? "rose" : "slate";
+  const assetColor = t.isFuture ? "cyan" : "violet";
+  const pnl = Number(t.unrealizedPnl ?? 0);
+  const pnlColor = pnl > 0 ? "emerald" : pnl < 0 ? "rose" : "slate";
 
+  return (
+    <div className="p-3 border-b border-slate-800/50 bg-slate-900/40 hover:bg-slate-800/40">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge color="indigo">AUTOTRADE</Badge>
+        <Badge color={biasColor}>{t.bias || "?"}</Badge>
+        <Badge color={assetColor}>{t.isFuture ? "Futures opt" : "Equity opt"}</Badge>
+        {t.mode && <Badge color={t.mode === "live" ? "rose" : "slate"}>{t.mode}</Badge>}
+        <span className="text-slate-400 text-xs">{ts(t.entryTs || t.timestamp)}</span>
+      </div>
+
+      <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-slate-200">
+        <span className="font-semibold">
+          {t.symbol} {t.right} ${num(t.strike, 0)}
+        </span>
+        <span>exp {t.expiry || "-"}</span>
+        <span>side {t.side}</span>
+        <span>qty {fmtQty(t.qty)}</span>
+        <span>UL ${num(t.ulPrice)}</span>
+      </div>
+
+      <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-slate-200 text-sm">
+        <span>fill (mid) ${num(t.entryPrice, 2)}</span>
+        {t.markPrice != null && <span>mark (mid) ${num(t.markPrice, 2)}</span>}
+        <span className={`font-semibold text-${pnlColor}-300`}>
+          PnL {fmtMoney(pnl)}
+        </span>
+      </div>
+
+      {typeof t.conid !== "undefined" && (
+        <div className="mt-1 text-xs text-slate-500">conid {t.conid}</div>
+      )}
+    </div>
+  );
+}
 /* ======================= Filters ======================= */
 function Filters({ filter, setFilter }: any) {
   const upd = (k: string, v: any) => setFilter((f: any) => ({ ...f, [k]: v }));
@@ -468,20 +508,6 @@ function Filters({ filter, setFilter }: any) {
         <option value="BTC">BTC</option>
         <option value="STC">STC</option>
       </select>
-
-      {/* Optional stance filter */}
-      <select
-        value={filter.stance}
-        onChange={(e) => upd("stance", e.target.value)}
-        className="bg-slate-800/60 border border-slate-700 rounded px-3 py-2 text-slate-100"
-      >
-        <option value="">Any stance</option>
-        <option value="BULL">BULL</option>
-        <option value="BEAR">BEAR</option>
-        <option value="HEDGE?">HEDGE?</option>
-        <option value="NEUTRAL">NEUTRAL</option>
-      </select>
-
       <div className="flex items-center gap-2 text-slate-300">
         <span className="text-xs">Premium ≥</span>
         <input
@@ -508,26 +534,21 @@ export default function TradeFlashUI() {
 
   const [paused, setPaused] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
-  const { trades, prints, quotes, welcome, avail } = useStreamBuckets(lastMsg, paused);
+  const { trades, prints, quotes, autoTrades, welcome, avail } = useStreamBuckets(lastMsg, paused);
   const { resolve } = useConidMapping(lastMsg);
 
   const [tab, setTab] = useState("stream");
-  const [filter, setFilter] = useState({
-    symbol: "",
-    assetClass: "",
-    direction: "",
-    minPremium: 0,
-    stance: "",
-  });
+  const [filter, setFilter] = useState({ symbol: "", assetClass: "", direction: "", minPremium: 0 });
 
-  // Mixed stream (Trades + Prints)
+  // Mixed stream (Trades + Prints + AutoTrades)
   const stream = useMemo(() => {
     const merged = [
-      ...trades.map((x) => ({ _k: `${x.timestamp}-T-${x.conid ?? Math.random()}`, t: "TRADE", d: x })),
-      ...prints.map((x) => ({ _k: `${x.timestamp}-P-${x.conid ?? Math.random()}`, t: "PRINT", d: x })),
+      ...trades.map((x, idx) => ({ _k: `T-${idx}-${x.timestamp}-${x.conid ?? Math.random()}`, t: "TRADE", d: x })),
+      ...prints.map((x, idx) => ({ _k: `P-${idx}-${x.timestamp}-${x.conid ?? Math.random()}`, t: "PRINT", d: x })),
+      ...autoTrades.map((x, idx) => ({ _k: `A-${idx}-${x.timestamp}`, t: "AUTO", d: x })),
     ].sort((a, b) => (b.d.timestamp || 0) - (a.d.timestamp || 0));
     return merged.slice(0, MAX_ROWS);
-  }, [trades, prints]);
+  }, [trades, prints, autoTrades]);
 
   const filteredTrades = useMemo(
     () =>
@@ -536,10 +557,6 @@ export default function TradeFlashUI() {
         if (filter.assetClass && d.assetClass !== filter.assetClass) return false;
         if (filter.direction && d.direction !== filter.direction) return false;
         if ((filter.minPremium || 0) > 0 && (d.premium || 0) < filter.minPremium) return false;
-        if (filter.stance) {
-          const s = stanceOf(d);
-          if (s !== filter.stance) return false;
-        }
         return true;
       }),
     [trades, filter]
@@ -551,13 +568,14 @@ export default function TradeFlashUI() {
     const el = containerRef.current;
     if (!el) return;
     el.scrollTop = 0; // newest at top
-  }, [stream, filteredTrades, prints, quotes, autoScroll]);
+  }, [stream, filteredTrades, prints, quotes, autoTrades, autoScroll]);
 
   const tabs = [
     { key: "stream", label: "Stream", count: stream.length },
     { key: "trades", label: "Trades", count: filteredTrades.length },
     { key: "prints", label: "Prints", count: prints.length },
     { key: "quotes", label: "Quotes", count: quotes.length },
+    { key: "autotrades", label: "Auto", count: autoTrades.length },
     { key: "settings", label: "Settings" },
   ];
 
@@ -568,7 +586,8 @@ export default function TradeFlashUI() {
         <div className="px-4 pt-5 pb-2">
           <h1 className="text-xl font-semibold">TradeFlash – IBKR Flow Client</h1>
           <p className="text-slate-400 text-sm">
-            Resolves conId → symbol and shows stance (BULL/BEAR/HEDGE?/NEUTRAL) for prints/trades.
+            Connected to IBKR Flow (Equities + Futures) – 25 ATM, ~15 DTE with live quotes, prints, auto-trades &
+            BTO/STO/BTC/STC
           </p>
         </div>
 
@@ -584,19 +603,11 @@ export default function TradeFlashUI() {
         <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800/60 bg-slate-900/40">
           <div className="flex items-center gap-3">
             <label className="flex items-center gap-2 text-slate-300 text-sm">
-              <input
-                type="checkbox"
-                checked={paused}
-                onChange={(e) => setPaused(e.target.checked)}
-              />
+              <input type="checkbox" checked={paused} onChange={(e) => setPaused(e.target.checked)} />
               Pause
             </label>
             <label className="flex items-center gap-2 text-slate-300 text-sm">
-              <input
-                type="checkbox"
-                checked={autoScroll}
-                onChange={(e) => setAutoScroll(e.target.checked)}
-              />
+              <input type="checkbox" checked={autoScroll} onChange={(e) => setAutoScroll(e.target.checked)} />
               Auto-scroll
             </label>
           </div>
@@ -615,8 +626,10 @@ export default function TradeFlashUI() {
               {stream.map((row) =>
                 row.t === "TRADE" ? (
                   <RowTrade key={row._k} d={row.d} />
-                ) : (
+                ) : row.t === "PRINT" ? (
                   <RowPrint key={row._k} p={row.d} />
+                ) : (
+                  <RowAutoTrade key={row._k} t={row.d} />
                 )
               )}
             </div>
@@ -657,28 +670,63 @@ export default function TradeFlashUI() {
             </div>
           )}
 
+          {tab === "autotrades" && (
+            <div>
+              {autoTrades.map((t, i) => (
+                <RowAutoTrade key={(t.timestamp || i) + "-a"} t={t} />
+              ))}
+              {autoTrades.length === 0 && (
+                <div className="p-6 text-slate-400 text-sm">
+                  No auto trades yet. Turn on AUTOTRADE on the server to see picks.
+                </div>
+              )}
+            </div>
+          )}
+
           {tab === "settings" && (
-            <div className="p-4 text-slate-300 space-y-3">
+            <div className="p-4 text-slate-300 space-y-4">
               <div>
                 <div className="text-sm text-slate-400">WebSocket</div>
-                <div className="text-xs">{wsUrl}</div>
+                <div className="text-xs break-all">{wsUrl}</div>
               </div>
-              <div className="text-sm text-slate-400">Tips</div>
-              <ul className="list-disc ml-5 text-sm text-slate-300 space-y-1">
-                <li>
-                  Quotes show resolved labels once a <code>CONID_MAPPING</code> arrives for that
-                  conid.
-                </li>
-                <li>
-                  For options, the label is: <code>SYMBOL YYYYMMDD RIGHT STRIKE</code>. For
-                  underlyings: just <code>SYMBOL</code>.
-                </li>
-                <li>
-                  If a label is missing, the raw <code>conid</code> displays until a mapping
-                  message arrives.
-                </li>
-                <li>PRINT rows show stance with an optional confidence score and notes.</li>
-              </ul>
+
+              <div>
+                <div className="text-sm text-slate-400 mb-1">What this UI currently shows</div>
+                <ul className="list-disc ml-5 text-sm text-slate-300 space-y-1">
+                  <li>The UI does <span className="font-semibold">not</span> show your real account fills or P&amp;L yet.</li>
+                  <li>It only shows:
+                    <ul className="list-disc ml-5 mt-1 space-y-0.5">
+                      <li><code className="text-xs bg-slate-800 px-1 py-0.5 rounded border border-slate-700">TRADE</code> – market flow (options flow the server detects)</li>
+                      <li><code className="text-xs bg-slate-800 px-1 py-0.5 rounded border border-slate-700">PRINT</code> – prints derived from live data</li>
+                      <li><code className="text-xs bg-slate-800 px-1 py-0.5 rounded border border-slate-700">AUTOTRADE_SIM</code> – autotrade decisions (what the engine wants to trade)</li>
+                    </ul>
+                  </li>
+                </ul>
+              </div>
+
+              <div>
+                <div className="text-sm text-slate-400 mb-1">If you want real account fills</div>
+                <ul className="list-disc ml-5 text-sm text-slate-300 space-y-1">
+                  <li>Add an <code className="text-xs bg-slate-800 px-1 py-0.5 rounded border border-slate-700">/iserver/account/trades</code> poll or websocket on the server.</li>
+                  <li>Normalize those to something like <code className="text-xs bg-slate-800 px-1 py-0.5 rounded border border-slate-700">type: "ACCOUNT_TRADE"</code>.</li>
+                  <li>Add a small <code className="text-xs bg-slate-800 px-1 py-0.5 rounded border border-slate-700">RowAccountTrade</code> component and an “Account” tab in this UI.</li>
+                </ul>
+              </div>
+
+              <div>
+                <div className="text-sm text-slate-400 mb-1">Tips</div>
+                <ul className="list-disc ml-5 text-sm text-slate-300 space-y-1">
+                  <li>Quotes show resolved labels when a <code className="text-xs bg-slate-800 px-1 py-0.5 rounded border border-slate-700">CONID_MAPPING</code> has been seen for that conId.</li>
+                  <li>
+                    For options, the label is: <code className="text-xs bg-slate-800 px-1 py-0.5 rounded border border-slate-700">SYMBOL YYYYMMDD RIGHT STRIKE</code>. For
+                    underlyings: just <code className="text-xs bg-slate-800 px-1 py-0.5 rounded border border-slate-700">SYMBOL</code>.
+                  </li>
+                  <li>
+                    Auto trades come from <code className="text-xs bg-slate-800 px-1 py-0.5 rounded border border-slate-700">AUTOTRADE_SIM</code> messages; switch the server to{" "}
+                    <code className="text-xs bg-slate-800 px-1 py-0.5 rounded border border-slate-700">AUTOTRADE_MODE=live</code> to actually send orders (once wired).
+                  </li>
+                </ul>
+              </div>
             </div>
           )}
         </div>
