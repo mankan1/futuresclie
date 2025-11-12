@@ -1,13 +1,14 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * TradeFlash UI – React Tabbed Client (with conId→Symbol mapping)
- * -----------------------------------------------------------------
+ * TradeFlash UI – React Tabbed Client (with conId→Symbol mapping + stance)
+ * ------------------------------------------------------------------------
  * - Connects to a Flow WS server (DEFAULT_WS)
  * - Builds a live map from IB conId → human symbol using broadcasted
  *   { type:"CONID_MAPPING", conid, mapping:{ symbol, type?, right?, strike?, expiry? } }
- *   and shows the resolved label in Quotes (and optionally elsewhere).
- * - Still supports Stream / Trades / Prints / Quotes tabs, filters, etc.
+ * - Renders Stream / Trades / Prints / Quotes tabs
+ * - Shows stance (BULL/BEAR/HEDGE?/NEUTRAL) for PRINTs (and Trades if present)
+ * - Includes optional stance filter on Trades
  */
 
 const DEFAULT_WS = "ws://localhost:3000/ws";
@@ -15,7 +16,9 @@ const MAX_ROWS = 500; // cap arrays to avoid memory bloat
 
 /* ======================= UI Bits ======================= */
 const Badge: React.FC<{ children: React.ReactNode; color?: string }> = ({ children, color = "slate" }) => (
-  <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-${color}-800/20 text-${color}-300 border border-${color}-700/30`}>
+  <span
+    className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-${color}-800/20 text-${color}-300 border border-${color}-700/30`}
+  >
     {children}
   </span>
 );
@@ -40,10 +43,26 @@ const DirPill: React.FC<{ dir?: string }> = ({ dir }) => {
   return <Badge color={color}>{dir || "-"}</Badge>;
 };
 
+const StanceBadge: React.FC<{ stance?: string }> = ({ stance }) => {
+  const color =
+    stance === "BULL" ? "emerald" :
+    stance === "BEAR" ? "rose" :
+    stance === "HEDGE?" ? "sky" :
+    "slate";
+  return (
+    <span
+      className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-${color}-800/20 text-${color}-300 border border-${color}-700/30`}
+    >
+      {stance || "NEUTRAL"}
+    </span>
+  );
+};
+
 function ts(t?: number | string) {
   if (!t) return "";
   try {
-    const v = typeof t === "string" && /\d{4}-\d{2}-\d{2}T/.test(t) ? new Date(t).getTime() : Number(t);
+    const v =
+      typeof t === "string" && /\d{4}-\d{2}-\d{2}T/.test(t) ? new Date(t).getTime() : Number(t);
     return new Date(v).toLocaleTimeString();
   } catch {
     return "";
@@ -58,27 +77,38 @@ function num(x: any, d = 2) {
 
 /* ======================= WS Hook ======================= */
 function useWebSocket(url: string) {
-  const [status, setStatus] = useState<"connected" | "connecting" | "disconnected" | "error">("disconnected");
+  const [status, setStatus] = useState<"connected" | "connecting" | "disconnected" | "error">(
+    "disconnected"
+  );
   const [lastMsg, setLastMsg] = useState<any>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
-  const connect = React.useCallback((customUrl?: string) => {
-    const u = customUrl || url;
-    try { wsRef.current?.close(); } catch {}
-    setStatus("connecting");
-    const ws = new WebSocket(u);
-    wsRef.current = ws;
+  const connect = React.useCallback(
+    (customUrl?: string) => {
+      const u = customUrl || url;
+      try {
+        wsRef.current?.close();
+      } catch {}
+      setStatus("connecting");
+      const ws = new WebSocket(u);
+      wsRef.current = ws;
 
-    ws.onopen = () => setStatus("connected");
-    ws.onclose = () => setStatus("disconnected");
-    ws.onerror = () => setStatus("error");
-    ws.onmessage = (evt) => {
-      try { setLastMsg(JSON.parse(evt.data)); } catch {}
-    };
-  }, [url]);
+      ws.onopen = () => setStatus("connected");
+      ws.onclose = () => setStatus("disconnected");
+      ws.onerror = () => setStatus("error");
+      ws.onmessage = (evt) => {
+        try {
+          setLastMsg(JSON.parse(evt.data));
+        } catch {}
+      };
+    },
+    [url]
+  );
 
   const disconnect = React.useCallback(() => {
-    try { wsRef.current?.close(); } catch {}
+    try {
+      wsRef.current?.close();
+    } catch {}
     setStatus("disconnected");
   }, []);
 
@@ -96,11 +126,11 @@ function useWebSocket(url: string) {
 
 /* ================= conId→Symbol Mapping ================= */
 export type Mapping = {
-  symbol: string;            // "/ES" or "SPY"
+  symbol: string; // "/ES" or "SPY"
   type?: "UNDERLYING" | string;
   right?: "C" | "P" | string;
   strike?: number;
-  expiry?: string;           // yyyymmdd
+  expiry?: string; // yyyymmdd
   discoveredAt?: number;
   lastSeen?: number;
 };
@@ -127,15 +157,32 @@ function useConidMapping(lastMsg: any) {
     }
 
     // Optional: If server sometimes embeds mapping inside quotes/trades, harvest here as well.
-    if ((lastMsg.type === "LIVE_QUOTE" || lastMsg.type === "UL_LIVE_QUOTE") && lastMsg.mapping && lastMsg.conid) {
+    if (
+      (lastMsg.type === "LIVE_QUOTE" || lastMsg.type === "UL_LIVE_QUOTE") &&
+      lastMsg.mapping &&
+      lastMsg.conid
+    ) {
       setMapState((cur) => ({ ...cur, [lastMsg.conid]: lastMsg.mapping as Mapping }));
     }
   }, [lastMsg]);
 
-  const resolve = React.useCallback((conid?: string | number) => (conid != null ? mapState[conid] : undefined), [mapState]);
+  const resolve = React.useCallback(
+    (conid?: string | number) => (conid != null ? mapState[conid] : undefined),
+    [mapState]
+  );
 
   return { conidMap: mapState, resolve };
 }
+
+/* ================= Helpers for stance keys (backward compatibility) === */
+const stanceOf = (x: any) => x?.stance ?? x?.stanceLabel ?? undefined;
+const stanceScoreOf = (x: any) => x?.stanceScore ?? x?.stance_score ?? undefined;
+const stanceNotesOf = (x: any) =>
+  Array.isArray(x?.stanceNotes)
+    ? x.stanceNotes
+    : Array.isArray(x?.stanceReasons)
+    ? x.stanceReasons
+    : [];
 
 /* ======================= Data Buckets ======================= */
 function useStreamBuckets(lastMsg: any, paused: boolean) {
@@ -143,7 +190,10 @@ function useStreamBuckets(lastMsg: any, paused: boolean) {
   const [prints, setPrints] = useState<any[]>([]);
   const [quotes, setQuotes] = useState<any[]>([]);
   const [welcome, setWelcome] = useState<any>(null);
-  const [avail, setAvail] = useState<{ futures: string[]; equities: string[] }>({ futures: [], equities: [] });
+  const [avail, setAvail] = useState<{ futures: string[]; equities: string[] }>({
+    futures: [],
+    equities: [],
+  });
 
   useEffect(() => {
     if (!lastMsg || paused) return;
@@ -173,12 +223,13 @@ function useStreamBuckets(lastMsg: any, paused: boolean) {
 
 /* ======================= Controls ======================= */
 function Toolbar({ wsUrl, setWsUrl, status, onConnect, onDisconnect }: any) {
-  const dot = {
-    connected: "bg-emerald-500",
-    connecting: "bg-amber-400",
-    error: "bg-rose-500",
-    disconnected: "bg-slate-500",
-  }[status] || "bg-slate-500";
+  const dot =
+    {
+      connected: "bg-emerald-500",
+      connecting: "bg-amber-400",
+      error: "bg-rose-500",
+      disconnected: "bg-slate-500",
+    }[status] || "bg-slate-500";
 
   return (
     <div className="flex flex-wrap items-center gap-2 p-3 border-b border-slate-800/60 bg-slate-900/60">
@@ -191,8 +242,18 @@ function Toolbar({ wsUrl, setWsUrl, status, onConnect, onDisconnect }: any) {
         value={wsUrl}
         onChange={(e) => setWsUrl(e.target.value)}
       />
-      <button className="px-3 py-2 rounded bg-emerald-700 text-emerald-50 hover:bg-emerald-600" onClick={() => onConnect(wsUrl)}>Connect</button>
-      <button className="px-3 py-2 rounded bg-slate-700 text-slate-50 hover:bg-slate-600" onClick={onDisconnect}>Disconnect</button>
+      <button
+        className="px-3 py-2 rounded bg-emerald-700 text-emerald-50 hover:bg-emerald-600"
+        onClick={() => onConnect(wsUrl)}
+      >
+        Connect
+      </button>
+      <button
+        className="px-3 py-2 rounded bg-slate-700 text-slate-50 hover:bg-slate-600"
+        onClick={onDisconnect}
+      >
+        Disconnect
+      </button>
     </div>
   );
 }
@@ -212,19 +273,46 @@ function Subs({ send, avail }: any) {
         <span className="text-xs text-slate-400">Futures:</span>
         <div className="flex gap-2 flex-wrap">
           {(avail?.futures || ["/ES", "/NQ", "/YM", "/RTY", "/CL", "/GC"]).map((f: string) => (
-            <button key={f} onClick={() => toggle(futs, setFuts, f)} className={`px-2 py-1 rounded border text-sm ${futs.includes(f) ? "bg-cyan-800/30 border-cyan-600 text-cyan-200" : "bg-slate-800/40 border-slate-700 text-slate-300"}`}>{f}</button>
+            <button
+              key={f}
+              onClick={() => toggle(futs, setFuts, f)}
+              className={`px-2 py-1 rounded border text-sm ${
+                futs.includes(f)
+                  ? "bg-cyan-800/30 border-cyan-600 text-cyan-200"
+                  : "bg-slate-800/40 border-slate-700 text-slate-300"
+              }`}
+            >
+              {f}
+            </button>
           ))}
         </div>
       </div>
       <div className="flex items-center gap-2">
         <span className="text-xs text-slate-400">Equities:</span>
         <div className="flex gap-2 flex-wrap">
-          {(avail?.equities || ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "AMZN", "MSFT", "META", "GOOGL"]).map((s: string) => (
-            <button key={s} onClick={() => toggle(eqs, setEqs, s)} className={`px-2 py-1 rounded border text-sm ${eqs.includes(s) ? "bg-fuchsia-800/30 border-fuchsia-600 text-fuchsia-200" : "bg-slate-800/40 border-slate-700 text-slate-300"}`}>{s}</button>
-          ))}
+          {(avail?.equities || ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "AMZN", "MSFT", "META", "GOOGL"]).map(
+            (s: string) => (
+              <button
+                key={s}
+                onClick={() => toggle(eqs, setEqs, s)}
+                className={`px-2 py-1 rounded border text-sm ${
+                  eqs.includes(s)
+                    ? "bg-fuchsia-800/30 border-fuchsia-600 text-fuchsia-200"
+                    : "bg-slate-800/40 border-slate-700 text-slate-300"
+                }`}
+              >
+                {s}
+              </button>
+            )
+          )}
         </div>
       </div>
-      <button onClick={doSend} className="ml-auto px-3 py-2 rounded bg-indigo-700 text-indigo-50 hover:bg-indigo-600">Subscribe</button>
+      <button
+        onClick={doSend}
+        className="ml-auto px-3 py-2 rounded bg-indigo-700 text-indigo-50 hover:bg-indigo-600"
+      >
+        Subscribe
+      </button>
     </div>
   );
 }
@@ -234,7 +322,13 @@ function Tabs({ tabs, active, onTab }: any) {
     <div className="border-b border-slate-800/60 bg-slate-900/40">
       <div className="flex gap-1 p-2 overflow-x-auto">
         {tabs.map((t: any) => (
-          <button key={t.key} onClick={() => onTab(t.key)} className={`px-3 py-2 rounded-t ${active === t.key ? "bg-slate-800 text-white" : "text-slate-300 hover:text-white"}`}>
+          <button
+            key={t.key}
+            onClick={() => onTab(t.key)}
+            className={`px-3 py-2 rounded-t ${
+              active === t.key ? "bg-slate-800 text-white" : "text-slate-300 hover:text-white"
+            }`}
+          >
             {t.label}
             {t.count != null && <span className="ml-2 text-xs text-slate-400">{t.count}</span>}
           </button>
@@ -246,17 +340,24 @@ function Tabs({ tabs, active, onTab }: any) {
 
 /* ======================= Rows ======================= */
 function RowTrade({ d }: { d: any }) {
+  const stance = stanceOf(d);
+  const score = stanceScoreOf(d);
+
   return (
     <div className="p-3 border-b border-slate-800/50 hover:bg-slate-800/30">
       <div className="flex flex-wrap items-center gap-2">
         <DirPill dir={d.direction} />
+        {stance && <StanceBadge stance={stance} />}
+        {typeof score === "number" && <span className="text-xs text-slate-400">({score})</span>}
         {(d.classifications || []).map((t: string) => (
           <Tag key={t} t={t} />
         ))}
         <span className="text-slate-400 text-xs">{ts(d.timestamp)}</span>
       </div>
       <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-slate-200">
-        <span className="font-semibold">{d.symbol} {d.type} ${d.strike}</span>
+        <span className="font-semibold">
+          {d.symbol} {d.type} ${d.strike}
+        </span>
         <span>exp {d.expiry || "-"}</span>
         <span>size {d.size}</span>
         <span>OI {d.openInterest}</span>
@@ -269,7 +370,9 @@ function RowTrade({ d }: { d: any }) {
       </div>
       {d.historicalComparison && (
         <div className="mt-1 text-xs text-slate-400">
-          hist avgOI {d.historicalComparison.avgOI} | avgVol {d.historicalComparison.avgVolume} | OIΔ {d.historicalComparison.oiChange} | Vol× {d.historicalComparison.volumeMultiple}
+          hist avgOI {d.historicalComparison.avgOI} | avgVol {d.historicalComparison.avgVolume} | OIΔ{" "}
+          {d.historicalComparison.oiChange} | Vol× {d.historicalComparison.volumeMultiple} | days{" "}
+          {d.historicalComparison.dataPoints}
         </div>
       )}
     </div>
@@ -277,14 +380,25 @@ function RowTrade({ d }: { d: any }) {
 }
 
 function RowPrint({ p }: { p: any }) {
+  const stance = stanceOf(p);
+  const score = stanceScoreOf(p);
+  const notes = stanceNotesOf(p);
+
   return (
     <div className="p-3 border-b border-slate-800/50 hover:bg-slate-800/30">
       <div className="flex flex-wrap items-center gap-2">
-        <Badge color="sky">PRINT</Badge>
+        <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-sky-800/20 text-sky-300 border border-sky-700/30">
+          PRINT
+        </span>
+        <StanceBadge stance={stance} />
+        {typeof score === "number" && <span className="text-xs text-slate-400">({score})</span>}
         <span className="text-slate-400 text-xs">{ts(p.timestamp)}</span>
       </div>
+
       <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-slate-200">
-        <span className="font-semibold">{p.symbol} {p.right} ${p.strike}</span>
+        <span className="font-semibold">
+          {p.symbol} {p.right} ${num(p.strike, 0)}
+        </span>
         <span>exp {p.expiry || "-"}</span>
         <span>size {p.tradeSize}</span>
         <span>@ ${num(p.tradePrice)}</span>
@@ -292,6 +406,10 @@ function RowPrint({ p }: { p: any }) {
         <span>vol/OI {num(p.volOiRatio ?? 0, 2)}</span>
         <span>{p.aggressor ? "BUY-agg" : "SELL-agg"}</span>
       </div>
+
+      {notes.length > 0 && (
+        <div className="mt-1 text-xs text-slate-400">{notes.join(" · ")}</div>
+      )}
     </div>
   );
 }
@@ -330,21 +448,48 @@ function Filters({ filter, setFilter }: any) {
         value={filter.symbol}
         onChange={(e) => upd("symbol", e.target.value.toUpperCase())}
       />
-      <select value={filter.assetClass} onChange={(e) => upd("assetClass", e.target.value)} className="bg-slate-800/60 border border-slate-700 rounded px-3 py-2 text-slate-100">
+      <select
+        value={filter.assetClass}
+        onChange={(e) => upd("assetClass", e.target.value)}
+        className="bg-slate-800/60 border border-slate-700 rounded px-3 py-2 text-slate-100"
+      >
         <option value="">All assets</option>
         <option value="EQUITY_OPTION">Equity options</option>
         <option value="FUTURES_OPTION">Futures options</option>
       </select>
-      <select value={filter.direction} onChange={(e) => upd("direction", e.target.value)} className="bg-slate-800/60 border border-slate-700 rounded px-3 py-2 text-slate-100">
+      <select
+        value={filter.direction}
+        onChange={(e) => upd("direction", e.target.value)}
+        className="bg-slate-800/60 border border-slate-700 rounded px-3 py-2 text-slate-100"
+      >
         <option value="">Any direction</option>
         <option value="BTO">BTO</option>
         <option value="STO">STO</option>
         <option value="BTC">BTC</option>
         <option value="STC">STC</option>
       </select>
+
+      {/* Optional stance filter */}
+      <select
+        value={filter.stance}
+        onChange={(e) => upd("stance", e.target.value)}
+        className="bg-slate-800/60 border border-slate-700 rounded px-3 py-2 text-slate-100"
+      >
+        <option value="">Any stance</option>
+        <option value="BULL">BULL</option>
+        <option value="BEAR">BEAR</option>
+        <option value="HEDGE?">HEDGE?</option>
+        <option value="NEUTRAL">NEUTRAL</option>
+      </select>
+
       <div className="flex items-center gap-2 text-slate-300">
         <span className="text-xs">Premium ≥</span>
-        <input type="number" className="w-28 bg-slate-800/60 border border-slate-700 rounded px-2 py-1" value={filter.minPremium} onChange={(e) => upd("minPremium", Number(e.target.value || 0))} />
+        <input
+          type="number"
+          className="w-28 bg-slate-800/60 border border-slate-700 rounded px-2 py-1"
+          value={filter.minPremium}
+          onChange={(e) => upd("minPremium", Number(e.target.value || 0))}
+        />
       </div>
     </div>
   );
@@ -356,15 +501,24 @@ export default function TradeFlashUI() {
   const { status, lastMsg, connect, disconnect, send } = useWebSocket(wsUrl);
 
   // Auto-connect on mount
-  useEffect(() => { connect(wsUrl); /* eslint-disable-line react-hooks/exhaustive-deps */ }, []);
+  useEffect(() => {
+    connect(wsUrl);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const [paused, setPaused] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const { trades, prints, quotes, welcome, avail } = useStreamBuckets(lastMsg, paused);
-  const { resolve } = useConidMapping(lastMsg); // <-- mapping hook wired here
+  const { resolve } = useConidMapping(lastMsg);
 
   const [tab, setTab] = useState("stream");
-  const [filter, setFilter] = useState({ symbol: "", assetClass: "", direction: "", minPremium: 0 });
+  const [filter, setFilter] = useState({
+    symbol: "",
+    assetClass: "",
+    direction: "",
+    minPremium: 0,
+    stance: "",
+  });
 
   // Mixed stream (Trades + Prints)
   const stream = useMemo(() => {
@@ -382,6 +536,10 @@ export default function TradeFlashUI() {
         if (filter.assetClass && d.assetClass !== filter.assetClass) return false;
         if (filter.direction && d.direction !== filter.direction) return false;
         if ((filter.minPremium || 0) > 0 && (d.premium || 0) < filter.minPremium) return false;
+        if (filter.stance) {
+          const s = stanceOf(d);
+          if (s !== filter.stance) return false;
+        }
         return true;
       }),
     [trades, filter]
@@ -409,20 +567,36 @@ export default function TradeFlashUI() {
         {/* Header */}
         <div className="px-4 pt-5 pb-2">
           <h1 className="text-xl font-semibold">TradeFlash – IBKR Flow Client</h1>
-          <p className="text-slate-400 text-sm">Now resolving conId → real symbol from broadcasted CONID_MAPPING.</p>
+          <p className="text-slate-400 text-sm">
+            Resolves conId → symbol and shows stance (BULL/BEAR/HEDGE?/NEUTRAL) for prints/trades.
+          </p>
         </div>
 
-        <Toolbar wsUrl={wsUrl} setWsUrl={setWsUrl} status={status} onConnect={connect} onDisconnect={disconnect} />
+        <Toolbar
+          wsUrl={wsUrl}
+          setWsUrl={setWsUrl}
+          status={status}
+          onConnect={connect}
+          onDisconnect={disconnect}
+        />
         <Subs send={send} avail={avail} />
 
         <div className="flex items-center justify-between px-3 py-2 border-b border-slate-800/60 bg-slate-900/40">
           <div className="flex items-center gap-3">
             <label className="flex items-center gap-2 text-slate-300 text-sm">
-              <input type="checkbox" checked={paused} onChange={(e) => setPaused(e.target.checked)} />
+              <input
+                type="checkbox"
+                checked={paused}
+                onChange={(e) => setPaused(e.target.checked)}
+              />
               Pause
             </label>
             <label className="flex items-center gap-2 text-slate-300 text-sm">
-              <input type="checkbox" checked={autoScroll} onChange={(e) => setAutoScroll(e.target.checked)} />
+              <input
+                type="checkbox"
+                checked={autoScroll}
+                onChange={(e) => setAutoScroll(e.target.checked)}
+              />
               Auto-scroll
             </label>
           </div>
@@ -432,10 +606,19 @@ export default function TradeFlashUI() {
         <Tabs tabs={tabs} active={tab} onTab={setTab} />
         {tab === "trades" && <Filters filter={filter} setFilter={setFilter} />}
 
-        <div ref={containerRef} className="h-[70vh] overflow-auto border-x border-b border-slate-800/60 bg-slate-900/20">
+        <div
+          ref={containerRef}
+          className="h-[70vh] overflow-auto border-x border-b border-slate-800/60 bg-slate-900/20"
+        >
           {tab === "stream" && (
             <div>
-              {stream.map((row) => (row.t === "TRADE" ? <RowTrade key={row._k} d={row.d} /> : <RowPrint key={row._k} p={row.d} />))}
+              {stream.map((row) =>
+                row.t === "TRADE" ? (
+                  <RowTrade key={row._k} d={row.d} />
+                ) : (
+                  <RowPrint key={row._k} p={row.d} />
+                )
+              )}
             </div>
           )}
 
@@ -444,7 +627,11 @@ export default function TradeFlashUI() {
               {filteredTrades.map((d, i) => (
                 <RowTrade key={(d.timestamp || i) + "-t"} d={d} />
               ))}
-              {filteredTrades.length === 0 && <div className="p-6 text-slate-400 text-sm">No trades yet. Try widening filters or wait for data.</div>}
+              {filteredTrades.length === 0 && (
+                <div className="p-6 text-slate-400 text-sm">
+                  No trades yet. Try widening filters or wait for data.
+                </div>
+              )}
             </div>
           )}
 
@@ -453,7 +640,9 @@ export default function TradeFlashUI() {
               {prints.map((p, i) => (
                 <RowPrint key={(p.timestamp || i) + "-p"} p={p} />
               ))}
-              {prints.length === 0 && <div className="p-6 text-slate-400 text-sm">No prints yet.</div>}
+              {prints.length === 0 && (
+                <div className="p-6 text-slate-400 text-sm">No prints yet.</div>
+              )}
             </div>
           )}
 
@@ -462,7 +651,9 @@ export default function TradeFlashUI() {
               {quotes.map((q, i) => (
                 <RowQuote key={(q.timestamp || i) + "-q"} q={q} resolve={resolve} />
               ))}
-              {quotes.length === 0 && <div className="p-6 text-slate-400 text-sm">No quotes yet.</div>}
+              {quotes.length === 0 && (
+                <div className="p-6 text-slate-400 text-sm">No quotes yet.</div>
+              )}
             </div>
           )}
 
@@ -474,9 +665,19 @@ export default function TradeFlashUI() {
               </div>
               <div className="text-sm text-slate-400">Tips</div>
               <ul className="list-disc ml-5 text-sm text-slate-300 space-y-1">
-                <li>Quotes now show resolved labels when a CONID_MAPPING has been seen for that conId.</li>
-                <li>For options, the label is: <code>SYMBOL YYYYMMDD RIGHT STRIKE</code>. For underlyings: just <code>SYMBOL</code>.</li>
-                <li>If a label is missing, the raw <code>conid</code> will be displayed until a mapping message arrives.</li>
+                <li>
+                  Quotes show resolved labels once a <code>CONID_MAPPING</code> arrives for that
+                  conid.
+                </li>
+                <li>
+                  For options, the label is: <code>SYMBOL YYYYMMDD RIGHT STRIKE</code>. For
+                  underlyings: just <code>SYMBOL</code>.
+                </li>
+                <li>
+                  If a label is missing, the raw <code>conid</code> displays until a mapping
+                  message arrives.
+                </li>
+                <li>PRINT rows show stance with an optional confidence score and notes.</li>
               </ul>
             </div>
           )}
