@@ -75,6 +75,126 @@ function fmtQty(x: any): string {
   return n.toString();
 }
 
+/* ========== NEW: Delta aggregation helpers (net flow “scoreboard”) ========== */
+
+type SymbolFlow = {
+  symbol: string;
+  netDelta: number;
+  stance: "BULL" | "BEAR" | "NEUTRAL";
+};
+
+type OverallFlow = {
+  netDelta: number;
+  stance: "BULL" | "BEAR" | "NEUTRAL";
+};
+
+function stanceFromNetDelta(netDelta: number, deadZone: number): "BULL" | "BEAR" | "NEUTRAL" {
+  if (netDelta > deadZone) return "BULL";
+  if (netDelta < -deadZone) return "BEAR";
+  return "NEUTRAL";
+}
+
+function fmtDeltaCompact(netDelta: number): string {
+  if (!netDelta) return "0 Δ";
+  const sign = netDelta >= 0 ? "+" : "-";
+  const abs = Math.abs(netDelta);
+  if (abs >= 1_000_000) return `${sign}${(abs / 1_000_000).toFixed(1)}M Δ`;
+  if (abs >= 1_000) return `${sign}${(abs / 1_000).toFixed(1)}k Δ`;
+  return `${sign}${abs.toFixed(0)} Δ`;
+}
+
+function computeDeltaFlows(trades: any[]): { overallFlow: OverallFlow; symbolFlows: SymbolFlow[] } {
+  const perSymbol: Record<string, number> = {};
+  let total = 0;
+
+  for (const t of trades) {
+    const sym = t.symbol;
+    if (!sym) continue;
+
+    const size = Number(t.size ?? 0);
+    const delta = Number(t.greeks?.delta ?? 0);
+    if (!size || !delta) continue;
+
+    const multiplier =
+      typeof t.multiplier === "number"
+        ? t.multiplier
+        : t.assetClass === "FUTURES_OPTION"
+        ? 50
+        : 100;
+
+    const base = delta * size * multiplier;
+
+    let signed = base;
+    switch (t.direction) {
+      case "BTO":
+      case "STC":
+        signed = base;
+        break;
+      case "STO":
+      case "BTC":
+        signed = -base;
+        break;
+      default:
+        signed = t.aggressor ? base : -base;
+    }
+
+    perSymbol[sym] = (perSymbol[sym] || 0) + signed;
+    total += signed;
+  }
+
+  const deadZone = 5_000; // small dead zone to avoid noise
+
+  const symbolFlows: SymbolFlow[] = Object.entries(perSymbol)
+    .map(([symbol, netDelta]) => ({
+      symbol,
+      netDelta,
+      stance: stanceFromNetDelta(netDelta, deadZone),
+    }))
+    .sort((a, b) => Math.abs(b.netDelta) - Math.abs(a.netDelta));
+
+  const overallFlow: OverallFlow = {
+    netDelta: total,
+    stance: stanceFromNetDelta(total, deadZone),
+  };
+
+  return { overallFlow, symbolFlows };
+}
+
+function stanceTextColor(stance: "BULL" | "BEAR" | "NEUTRAL"): string {
+  if (stance === "BULL") return "text-emerald-300";
+  if (stance === "BEAR") return "text-rose-300";
+  return "text-slate-300";
+}
+
+function FlowSummaryStrip({ overall, symbols }: { overall: OverallFlow; symbols: SymbolFlow[] }) {
+  // If nothing meaningful yet, hide.
+  if (!symbols.length && !overall.netDelta) return null;
+
+  const top = symbols.slice(0, 4);
+
+  return (
+    <div className="px-3 py-2 border-b border-slate-800/60 bg-slate-900/60 flex flex-wrap items-center gap-3 text-xs">
+      <div className="flex items-center gap-2 mr-2">
+        <span className="text-slate-400">Overall Flow:</span>
+        <span className={`font-semibold ${stanceTextColor(overall.stance)}`}>{overall.stance}</span>
+        <span className="text-slate-100">{fmtDeltaCompact(overall.netDelta)}</span>
+      </div>
+
+      {top.length > 0 && (
+        <div className="flex flex-wrap items-center gap-3">
+          {top.map((s) => (
+            <div key={s.symbol} className="flex items-center gap-1">
+              <span className="text-slate-400">{s.symbol}</span>
+              <span className={`font-semibold ${stanceTextColor(s.stance)}`}>{s.stance}</span>
+              <span className="text-slate-100">{fmtDeltaCompact(s.netDelta)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ======================= WS Hook ======================= */
 function useWebSocket(url: string) {
   const [status, setStatus] = useState<"connected" | "connecting" | "disconnected" | "error">("disconnected");
@@ -165,6 +285,7 @@ function useConidMapping(lastMsg: any) {
 
   return { conidMap: mapState, resolve };
 }
+
 function useStreamBuckets(lastMsg: any, paused: boolean) {
   const [trades, setTrades] = useState<any[]>([]);
   const [prints, setPrints] = useState<any[]>([]);
@@ -437,6 +558,7 @@ function RowQuote({ q, resolve }: { q: any; resolve: (id?: string | number) => M
     </div>
   );
 }
+
 function RowAutoTrade({ t }: { t: any }) {
   const biasColor = t.bias === "BULL" ? "emerald" : t.bias === "BEAR" ? "rose" : "slate";
   const assetColor = t.isFuture ? "cyan" : "violet";
@@ -477,6 +599,7 @@ function RowAutoTrade({ t }: { t: any }) {
     </div>
   );
 }
+
 /* ======================= Filters ======================= */
 function Filters({ filter, setFilter }: any) {
   const upd = (k: string, v: any) => setFilter((f: any) => ({ ...f, [k]: v }));
@@ -539,6 +662,9 @@ export default function TradeFlashUI() {
 
   const [tab, setTab] = useState("stream");
   const [filter, setFilter] = useState({ symbol: "", assetClass: "", direction: "", minPremium: 0 });
+
+  // NEW: compute cumulative delta flows from trades
+  const { overallFlow, symbolFlows } = useMemo(() => computeDeltaFlows(trades), [trades]);
 
   // Mixed stream (Trades + Prints + AutoTrades)
   const stream = useMemo(() => {
@@ -613,6 +739,9 @@ export default function TradeFlashUI() {
           </div>
           <div className="text-xs text-slate-400">{welcome?.message}</div>
         </div>
+
+        {/* NEW: Cumulative delta flow strip */}
+        <FlowSummaryStrip overall={overallFlow} symbols={symbolFlows} />
 
         <Tabs tabs={tabs} active={tab} onTab={setTab} />
         {tab === "trades" && <Filters filter={filter} setFilter={setFilter} />}
